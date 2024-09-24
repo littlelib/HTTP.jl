@@ -418,7 +418,7 @@ function listenloop(
     sem = Base.Semaphore(max_connections)
     @async begin
         for val in conns_channel
-            handlemessage(conns_channel, conns, isempty_channel)
+            @async handlemessage(conns_channel, conns, isempty_channel)
         end
     end
     verbose >= 0 && @infov 1 "Listening on: $(listener.hostname):$(listener.hostport), thread id: $(Threads.threadid())"
