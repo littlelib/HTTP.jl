@@ -96,6 +96,50 @@ function getsslcontext(tcp, sslconfig)
     end
 end
 
+abstract type ConnectionMessage end
+
+struct ForcecloseMessage <: ConnectionMessage end
+
+struct CloseconnectionMessage <: ConnectionMessage
+    connection::Connection
+end
+
+struct NewconnectionMessage <: ConnectionMessage
+    connection::Connection
+end
+
+struct RequestcloseMessage <: ConnectionMessage end
+struct IsemptyMessage <: ConnectionMessage end
+
+const CHANNEL_SIZE=10
+
+function handlemessage(::ForcecloseMessage, conns, channel)
+    for c in conns
+        close(c)
+    end
+end
+
+function handlemessage(::RequestcloseMessage, conns, channel)
+    for c in conns
+        requestclose!(c)
+    end
+end
+
+function handlemessage(::IsemptyMessage, conns, channel)
+    while true
+        isempty(conns) && break
+    end
+    put!(channel, IsemptyMessage())
+end
+
+function handlemessage(m::NewconnectionMessage, conns, channel)
+    push!(conns, m.connection)
+end
+
+function handlemessage(m::CloseconnectionMessage, conns, channel)
+    delete!(conns, m.connection)
+end
+
 """
     HTTP.Server
 
@@ -120,7 +164,8 @@ struct Server{L <: Listener}
     task::Task
     # Protects the connections Set which is mutated in the listenloop
     # while potentially being accessed by the close method at the same time
-    connections_lock::ReentrantLock
+    connections_channel::Channel{ConnectionMessage}
+    isempty_channel::Channel{IsemptyMessage}
 end
 
 port(s::Server) = Int(s.listener.addr.port)
@@ -130,11 +175,7 @@ Base.wait(s::Server) = wait(s.task)
 function forceclose(s::Server)
     shutdown(s.on_shutdown)
     close(s.listener)
-    Base.@lock s.connections_lock begin
-        for c in s.connections
-            close(c)
-        end
-    end
+    put!(s.connections_channel, ForcecloseMessage())
     return wait(s.task)
 end
 
@@ -171,19 +212,14 @@ function Base.close(s::Server)
     shutdown(s.on_shutdown)
     close(s.listener)
     # first pass to mark or request connections to close
-    Base.@lock s.connections_lock begin
-        for c in s.connections
-            requestclose!(c)
-        end
-    end
+    put!(s.connections_channel, RequestcloseMessage())
     # second pass to wait for connections to close
     # we wait for connections to empty because as
     # connections close themselves, they are removed
     # from our connections Set
     while true
-        Base.@lock s.connections_lock begin
-            isempty(s.connections) && break
-        end
+        put!(s.connections_channel, IsemptyMessage())
+        take!(s.isempty_channel)
         sleep(0.5 + rand() * 0.1)
     end
     return wait(s.task)
@@ -356,18 +392,19 @@ function listen!(f, listener::Listener;
     access_log::Union{Function,Nothing}=nothing,
     verbose=false, kw...)
     conns = Set{Connection}()
-    conns_lock = ReentrantLock()
+    conns_channel = Channel{ConnectionMessage}(CHANNEL_SIZE)
+    isempty_channel=Channel{IsemptyMessage}()
     ready_to_accept = Threads.Event()
     if verbose > 0
         tsk = @_spawn_interactive LoggingExtras.withlevel(Logging.Debug; verbosity=verbose) do
-            listenloop(f, listener, conns, tcpisvalid, max_connections, readtimeout, access_log, ready_to_accept, conns_lock, verbose)
+            listenloop(f, listener, conns, tcpisvalid, max_connections, readtimeout, access_log, ready_to_accept, conns_channel, isempty_channel, verbose)
         end
     else
-        tsk = @_spawn_interactive listenloop(f, listener, conns, tcpisvalid, max_connections, readtimeout, access_log, ready_to_accept, conns_lock, verbose)
+        tsk = @_spawn_interactive listenloop(f, listener, conns, tcpisvalid, max_connections, readtimeout, access_log, ready_to_accept, conns_channel, isempty_channel, verbose)
     end
     # wait until the listenloop enters the loop
     wait(ready_to_accept)
-    return Server(listener, on_shutdown, conns, tsk, conns_lock)
+    return Server(listener, on_shutdown, conns, tsk, conns_channel, isempty_channel)
 end
 
 """"
@@ -376,9 +413,14 @@ Accepts new tcp connections and spawns async tasks to handle them."
 """
 function listenloop(
     f, listener, conns, tcpisvalid, max_connections, readtimeout, access_log, ready_to_accept,
-    conns_lock, verbose
+    conns_channel, isempty_channel, verbose
 )
     sem = Base.Semaphore(max_connections)
+    @async begin
+        for val in conns_channel
+            handlemessage(conns_channel, conns, isempty_channel)
+        end
+    end
     verbose >= 0 && @infov 1 "Listening on: $(listener.hostname):$(listener.hostport), thread id: $(Threads.threadid())"
     notify(ready_to_accept)
     while isopen(listener)
@@ -395,13 +437,13 @@ function listenloop(
             end
             conn = Connection(io)
             conn.state = IDLE
-            Base.@lock conns_lock push!(conns, conn)
+            put!(conns_channel, NewconnectionMessage(conn))
             conn.host, conn.port = listener.hostname, listener.hostport
             @async try
                 handle_connection(f, conn, listener, readtimeout, access_log)
             finally
                 # handle_connection is in charge of closing the underlying io
-                Base.@lock conns_lock delete!(conns, conn)
+                put!(conns_channel, CloseconnectionMessage(conn))
                 Base.release(sem)
             end
         catch e
@@ -418,6 +460,7 @@ function listenloop(
             end
         end
     end
+    close(conns_channel)
     return
 end
 
