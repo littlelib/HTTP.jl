@@ -111,7 +111,7 @@ end
 struct RequestcloseMessage <: ConnectionMessage end
 struct IsemptyMessage <: ConnectionMessage end
 
-const CHANNEL_SIZE=10
+const CHANNEL_SIZE=typemax(Int)
 
 function handlemessage(::ForcecloseMessage, conns, channel)
     for c in conns
