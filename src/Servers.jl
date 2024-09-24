@@ -509,7 +509,7 @@ function handle_connection(f, c::Connection, listener, readtimeout, access_log)
             try
                 # invokelatest becuase the perf is negligible, but this makes live-editing handlers more Revise friendly
                 @debugv 1 "invoking handler"
-                Base.invokelatest(f, http)
+                Base.invokelatest(f, http|>deepcopy)
                 # If `startwrite()` was never called, throw an error so we send a 500 and log this
                 if isopen(http) && !iswritable(http)
                     error("Server never wrote a response.\n\n$request")
